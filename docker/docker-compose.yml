@@ -346,8 +346,8 @@ services:
     container_name: supabase-analytics
     image: supabase/logflare:1.27.0
     restart: unless-stopped
-    ports:
-      - 4000:4000
+#    ports:
+#      - 4000:4000
     # Uncomment to use Big Query backend for analytics
     # volumes:
     #   - type: bind
@@ -482,9 +482,9 @@ services:
     container_name: supabase-pooler
     image: supabase/supavisor:2.7.4
     restart: unless-stopped
-    ports:
-      - ${POSTGRES_PORT}:5432
-      - ${POOLER_PROXY_PORT_TRANSACTION}:6543
+#    ports:
+#      - ${POSTGRES_PORT}:5432
+#      - ${POOLER_PROXY_PORT_TRANSACTION}:6543
     volumes:
       - ./volumes/pooler/pooler.exs:/etc/pooler/pooler.exs:ro,z
     healthcheck:
