@@ -1,162 +1,391 @@
-version: "3.8"
+version: '3.8'
+
+networks:
+  db_overlay:
+    driver: overlay
+    attachable: true
+  captain-overlay-network:
+    external: true
 
 services:
   studio:
-    image: supabase/studio:20240101-831d102
+    image: supabase/studio:2025.12.17-sha-43f4f7f
+    # REMOVED: container_name and hostname - not compatible with Swarm mode
+    networks:
+      - db_overlay
+      - captain-overlay-network
+    healthcheck:
+      test: [ "CMD", "node", "-e", "fetch('http://localhost:3000/api/platform/profile').then((r) => {if (r.status !== 200) throw new Error(r.status)})" ]
+      timeout: 10s
+      interval: 5s
+      retries: 3
     deploy:
-      replicas: 1
-      placement:
-        constraints: [node.role == manager]
+      restart_policy:
+        condition: on-failure
+      labels:
+        # REMOVED label to prevent bypassing Kong gateway authentication
+        - "captainApplicationName=supabase-dashboard-internal"
+    depends_on:
+      - analytics
+      - db
+      - meta
     environment:
+      HOSTNAME: "::"
       STUDIO_PG_META_URL: http://meta:8080
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_HOST: db
+      POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PG_META_CRYPTO_KEY: ${PG_META_CRYPTO_KEY}
+      DEFAULT_ORGANIZATION_NAME: ${STUDIO_DEFAULT_ORGANIZATION}
+      DEFAULT_PROJECT_NAME: ${STUDIO_DEFAULT_PROJECT}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       SUPABASE_URL: http://kong:8000
-      SUPABASE_PUBLIC_URL: ${SUPABASE_PUBLIC_URL}
+      SUPABASE_PUBLIC_URL: ${API_EXTERNAL_URL}
       SUPABASE_ANON_KEY: ${ANON_KEY}
       SUPABASE_SERVICE_KEY: ${SERVICE_ROLE_KEY}
-      STUDIO_DEFAULT_ORGANIZATION: ${STUDIO_DEFAULT_ORGANIZATION}
-      STUDIO_DEFAULT_PROJECT: ${STUDIO_DEFAULT_PROJECT}
-    networks:
-      - captain-overlay-network
-      - internal
+      AUTH_JWT_SECRET: ${JWT_SECRET}
+      LOGFLARE_API_KEY: ${LOGFLARE_PUBLIC_ACCESS_TOKEN}
+      LOGFLARE_PUBLIC_ACCESS_TOKEN: ${LOGFLARE_PUBLIC_ACCESS_TOKEN}
+      LOGFLARE_PRIVATE_ACCESS_TOKEN: ${LOGFLARE_PRIVATE_ACCESS_TOKEN}
+      LOGFLARE_URL: http://analytics:4000
+      NEXT_PUBLIC_ENABLE_LOGS: "true"
+      NEXT_ANALYTICS_BACKEND_PROVIDER: postgres
+      STUDIO_SUPAVISOR_URL: http://pooler:4000
+      SUPAVISOR_URL: ${API_EXTERNAL_URL}/pooler/v1
+      API_EXTERNAL_URL: ${API_EXTERNAL_URL}
 
   kong:
-    image: kong:2.8.1
+    image: kong:3.8-ubuntu
+    networks:
+      - db_overlay
+      - captain-overlay-network
+    volumes:
+      - /opt/supabase/volumes/api/kong.yml:/etc/kong/kong.yml:ro
     deploy:
-      replicas: 1
+      restart_policy:
+        condition: on-failure
+      labels:
+        - "captainApplicationName=supabase-api"
+    depends_on:
+      - analytics
     environment:
       KONG_DATABASE: "off"
-      KONG_DECLARATIVE_CONFIG: /var/lib/kong/kong.yml
-      KONG_DNS_ORDER: LAST,A,CNAME
-      KONG_PLUGINS: request-transformer,cors,key-auth,acl,basic-auth
-      KONG_NGINX_PROXY_PROXY_BUFFER_SIZE: 160k
-      KONG_NGINX_PROXY_PROXY_BUFFERS: 64 160k
-    volumes:
-      # We bind to the HOST path because we initialized the files there.
-      - /opt/supabase/docker/volumes/api/kong.yml:/var/lib/kong/kong.yml
-    networks:
-      - captain-overlay-network
-      - internal
+      KONG_DECLARATIVE_CONFIG: /etc/kong/kong.yml
+      KONG_PLUGINS: bundled
+      KONG_PROXY_ACCESS_LOG: /dev/stdout
+      KONG_ADMIN_ACCESS_LOG: /dev/stdout
+      KONG_PROXY_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_ERROR_LOG: /dev/stderr
 
   auth:
-    image: supabase/gotrue:v2.132.3
+    image: supabase/gotrue:v2.184.0
+    networks:
+      - db_overlay
+    healthcheck:
+      test: [ "CMD", "sh", "-c", "wget -qO- http://127.0.0.1:9999/health || exit 1" ]
+      timeout: 5s
+      interval: 10s
+      retries: 10
+      start_period: 90s
     deploy:
-      replicas: 1
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+    depends_on:
+      - db
+      - analytics
     environment:
       GOTRUE_API_HOST: 0.0.0.0
       GOTRUE_API_PORT: 9999
       API_EXTERNAL_URL: ${API_EXTERNAL_URL}
+      # Database configuration
       GOTRUE_DB_DRIVER: postgres
-      GOTRUE_DB_DATABASE_URL: postgres://supabase_auth_admin:${POSTGRES_PASSWORD}@db:5432/postgres
+      GOTRUE_DB_DATABASE_URL: postgres://supabase_auth_admin:${POSTGRES_PASSWORD}@db:${POSTGRES_PORT}/${POSTGRES_DB}
       GOTRUE_SITE_URL: ${SITE_URL}
-      GOTRUE_JWT_SECRET: ${JWT_SECRET}
-      GOTRUE_JWT_EXP: ${JWT_EXPIRY:-3600}
+      GOTRUE_URI_ALLOW_LIST: ${ADDITIONAL_REDIRECT_URLS}
+      GOTRUE_DISABLE_SIGNUP: ${DISABLE_SIGNUP}
+      GOTRUE_JWT_ADMIN_ROLES: service_role
+      GOTRUE_JWT_AUD: authenticated
       GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
-      # Email Auth Configs
+      GOTRUE_JWT_EXP: ${JWT_EXPIRY}
+      GOTRUE_JWT_SECRET: ${JWT_SECRET}
+      GOTRUE_EXTERNAL_EMAIL_ENABLED: ${ENABLE_EMAIL_SIGNUP}
+      GOTRUE_EXTERNAL_ANONYMOUS_USERS_ENABLED: ${ENABLE_ANONYMOUS_USERS}
+      GOTRUE_MAILER_AUTOCONFIRM: ${ENABLE_EMAIL_AUTOCONFIRM}
+      GOTRUE_SMTP_ADMIN_EMAIL: ${SMTP_ADMIN_EMAIL}
       GOTRUE_SMTP_HOST: ${SMTP_HOST}
       GOTRUE_SMTP_PORT: ${SMTP_PORT}
       GOTRUE_SMTP_USER: ${SMTP_USER}
       GOTRUE_SMTP_PASS: ${SMTP_PASS}
-      GOTRUE_SMTP_ADMIN_EMAIL: ${SMTP_ADMIN_EMAIL}
       GOTRUE_SMTP_SENDER_NAME: ${SMTP_SENDER_NAME}
-    networks:
-      - internal
+      GOTRUE_MAILER_URLPATHS_INVITE: ${MAILER_URLPATHS_INVITE}
+      GOTRUE_MAILER_URLPATHS_CONFIRMATION: ${MAILER_URLPATHS_CONFIRMATION}
+      GOTRUE_MAILER_URLPATHS_RECOVERY: ${MAILER_URLPATHS_RECOVERY}
+      GOTRUE_MAILER_URLPATHS_EMAIL_CHANGE: ${MAILER_URLPATHS_EMAIL_CHANGE}
+      GOTRUE_EXTERNAL_PHONE_ENABLED: ${ENABLE_PHONE_SIGNUP}
+      GOTRUE_SMS_AUTOCONFIRM: ${ENABLE_PHONE_AUTOCONFIRM}
 
   rest:
-    image: postgrest/postgrest:v11.2.0
+    image: postgrest/postgrest:v14.1
+    networks:
+      - db_overlay
     deploy:
-      replicas: 1
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+    depends_on:
+      - db
+      - analytics
     environment:
-      PGRST_DB_URI: postgres://authenticator:${POSTGRES_PASSWORD}@db:5432/postgres
-      PGRST_DB_SCHEMAS: ${PGRST_DB_SCHEMAS:-public,storage,graphql_public}
+      # FIXED: Using 'db' service name (not 'supabase_db')
+      PGRST_DB_URI: postgres://authenticator:${POSTGRES_PASSWORD}@db:${POSTGRES_PORT}/${POSTGRES_DB}
+      PGRST_DB_SCHEMAS: ${PGRST_DB_SCHEMAS}
       PGRST_DB_ANON_ROLE: anon
       PGRST_JWT_SECRET: ${JWT_SECRET}
-      PGRST_DB_USE_LEGACY_GUC: "false"
-    networks:
-      - internal
+      PGRST_DB_USE_LEGACY_GUCS: "false"
+      PGRST_APP_SETTINGS_JWT_SECRET: ${JWT_SECRET}
+      PGRST_APP_SETTINGS_JWT_EXP: ${JWT_EXPIRY}
+    command: [ "postgrest" ]
 
   realtime:
-    image: supabase/realtime:v2.25.26
+    image: supabase/realtime:v2.68.0
+    networks:
+      - db_overlay
+    healthcheck:
+      test: [ "CMD", "curl", "-sL", "http://localhost:4000/health" ]
+      timeout: 5s
+      interval: 10s
+      retries: 10
+      start_period: 30s
     deploy:
-      replicas: 1
+      restart_policy:
+        condition: on-failure
+        delay: 15s
+    depends_on:
+      - db
+      - analytics
     environment:
       PORT: 4000
+      # CRITICAL FIX: Using 'db' service name - this fixes your :nxdomain error!
       DB_HOST: db
-      DB_PORT: 5432
+      DB_PORT: ${POSTGRES_PORT}
       DB_USER: supabase_admin
       DB_PASSWORD: ${POSTGRES_PASSWORD}
-      DB_NAME: postgres
+      DB_NAME: ${POSTGRES_DB}
       DB_AFTER_CONNECT_QUERY: 'SET search_path TO _realtime'
-      DB_ENC_KEY: ${SECRET_KEY_BASE}
+      DB_ENC_KEY: supabaserealtime
       API_JWT_SECRET: ${JWT_SECRET}
-      FLY_ALLOC_ID: fly_alloc_id
-      GO_VM_UDP_Sender: 127.0.0.1
-    networks:
-      - internal
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE}
+      ERL_AFLAGS: -proto_dist inet_tcp
+      DNS_NODES: "''"
+      RLIMIT_NOFILE: "10000"
+      APP_NAME: realtime
+      SEED_SELF_HOST: "true"
+      RUN_JANITOR: "true"
 
   storage:
-    image: supabase/storage-api:v1.0.1
+    image: supabase/storage-api:v1.33.0
+    networks:
+      - db_overlay
+    volumes:
+      - /opt/supabase/volumes/storage:/var/lib/storage
+    healthcheck:
+      test: [ "CMD", "sh", "-c", "wget -qO- http://127.0.0.1:5000/status || exit 1" ]
+      timeout: 5s
+      interval: 10s
+      retries: 10
+      start_period: 90s
     deploy:
-      replicas: 1
+      restart_policy:
+        condition: on-failure
+        delay: 15s
+    depends_on:
+      - db
+      - rest
+      - imgproxy
     environment:
       ANON_KEY: ${ANON_KEY}
       SERVICE_KEY: ${SERVICE_ROLE_KEY}
       POSTGREST_URL: http://rest:3000
       PGRST_JWT_SECRET: ${JWT_SECRET}
-      DATABASE_URL: postgres://supabase_storage_admin:${POSTGRES_PASSWORD}@db:5432/postgres
+      # FIXED: Using 'db' service name
+      DATABASE_URL: postgres://supabase_storage_admin:${POSTGRES_PASSWORD}@db:${POSTGRES_PORT}/${POSTGRES_DB}
+      REQUEST_ALLOW_X_FORWARDED_PATH: "true"
       FILE_SIZE_LIMIT: 52428800
-    networks:
-      - internal
+      STORAGE_BACKEND: file
+      FILE_STORAGE_BACKEND_PATH: /var/lib/storage
+      TENANT_ID: stub
+      REGION: stub
+      GLOBAL_S3_BUCKET: stub
+      ENABLE_IMAGE_TRANSFORMATION: "true"
+      IMGPROXY_URL: http://imgproxy:5001
 
   imgproxy:
     image: darthsim/imgproxy:v3.8.0
+    networks:
+      - db_overlay
+    volumes:
+      - /opt/supabase/volumes/storage:/var/lib/storage
+    healthcheck:
+      test: [ "CMD", "imgproxy", "health" ]
+      timeout: 5s
+      interval: 5s
+      retries: 3
     deploy:
-      replicas: 1
+      restart_policy:
+        condition: on-failure
     environment:
       IMGPROXY_BIND: ":5001"
       IMGPROXY_LOCAL_FILESYSTEM_ROOT: /
       IMGPROXY_USE_ETAG: "true"
-      IMGPROXY_ENABLE_WEBP_DETECTION: ${IMGPROXY_ENABLE_WEBP_DETECTION:-true}
-    networks:
-      - internal
+      IMGPROXY_ENABLE_WEBP_DETECTION: ${IMGPROXY_ENABLE_WEBP_DETECTION}
 
   meta:
-    image: supabase/postgres-meta:v0.80.0
+    image: supabase/postgres-meta:v0.95.1
+    networks:
+      - db_overlay
     deploy:
-      replicas: 1
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+    depends_on:
+      - db
+      - analytics
     environment:
       PG_META_PORT: 8080
+      # FIXED: Using 'db' service name
       PG_META_DB_HOST: db
+      PG_META_DB_PORT: ${POSTGRES_PORT}
+      PG_META_DB_NAME: ${POSTGRES_DB}
+      PG_META_DB_USER: supabase_admin
       PG_META_DB_PASSWORD: ${POSTGRES_PASSWORD}
-      PG_META_CRYPTO_KEY: ${PG_META_CRYPTO_KEY}
+      CRYPTO_KEY: ${PG_META_CRYPTO_KEY}
+
+  functions:
+    image: supabase/edge-runtime:v1.69.28
     networks:
-      - internal
+      - db_overlay
+    volumes:
+      - /opt/supabase/volumes/functions:/home/deno/functions:Z
+    deploy:
+      restart_policy:
+        condition: on-failure
+    depends_on:
+      - analytics
+    environment:
+      JWT_SECRET: ${JWT_SECRET}
+      SUPABASE_URL: http://kong:8000
+      SUPABASE_ANON_KEY: ${ANON_KEY}
+      SUPABASE_SERVICE_ROLE_KEY: ${SERVICE_ROLE_KEY}
+      # FIXED: Using 'db' service name
+      SUPABASE_DB_URL: postgres://postgres:${POSTGRES_PASSWORD}@db:${POSTGRES_PORT}/${POSTGRES_DB}
+      VERIFY_JWT: "${FUNCTIONS_VERIFY_JWT}"
+    command: [ "start", "--main-service", "/home/deno/functions/main" ]
 
   analytics:
-    image: supabase/logflare:1.4.0
-    deploy:
-      replicas: 1
-    environment:
-      LOGFLARE_API_KEY: ${LOGFLARE_PUBLIC_ACCESS_TOKEN}
-      # This is a sample, Logflare usually requires more complex init
+    image: supabase/logflare:1.27.0
     networks:
-      - internal
+      - db_overlay
+    healthcheck:
+      test: [ "CMD", "curl", "http://localhost:4000/health" ]
+      timeout: 5s
+      interval: 5s
+      retries: 10
+    deploy:
+      restart_policy:
+        condition: on-failure
+    depends_on:
+      - db
+    environment:
+      LOGFLARE_NODE_HOST: 127.0.0.1
+      DB_USERNAME: supabase_admin
+      DB_DATABASE: _supabase
+      # FIXED: Using 'db' service name
+      DB_HOSTNAME: db
+      DB_PORT: ${POSTGRES_PORT}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_SCHEMA: _analytics
+      LOGFLARE_PUBLIC_ACCESS_TOKEN: ${LOGFLARE_PUBLIC_ACCESS_TOKEN}
+      LOGFLARE_PRIVATE_ACCESS_TOKEN: ${LOGFLARE_PRIVATE_ACCESS_TOKEN}
+      # FIXED: Proper connection string
+      POSTGRES_BACKEND_URL: postgres://supabase_admin:${POSTGRES_PASSWORD}@db:${POSTGRES_PORT}/_supabase
+      POSTGRES_BACKEND_SCHEMA: _analytics
+      LOGFLARE_FEATURE_FLAG_OVERRIDE: multibackend=true
+
+  pooler:
+    image: supabase/supavisor:2.7.4
+    networks:
+      - db_overlay
+    # No healthcheck - supavisor image lacks curl/wget
+    volumes:
+      - /opt/supabase/volumes/pooler/pooler.exs:/etc/pooler/pooler.exs:ro
+    deploy:
+      restart_policy:
+        condition: on-failure
+        delay: 15s
+    depends_on:
+      - db
+    environment:
+      PORT: 4000
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      # Ecto connection string - must use _supabase database
+      DATABASE_URL: ecto://supabase_admin:${POSTGRES_PASSWORD}@db:${POSTGRES_PORT}/_supabase
+      CLUSTER_POSTGRES: "true"
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE}
+      VAULT_ENC_KEY: ${VAULT_ENC_KEY}
+      API_JWT_SECRET: ${JWT_SECRET}
+      METRICS_JWT_SECRET: ${JWT_SECRET}
+      REGION: local
+      ERL_AFLAGS: -proto_dist inet_tcp
+      POOLER_TENANT_ID: ${POOLER_TENANT_ID}
+      POOLER_DEFAULT_POOL_SIZE: ${POOLER_DEFAULT_POOL_SIZE}
+      POOLER_MAX_CLIENT_CONN: ${POOLER_MAX_CLIENT_CONN}
+      POOLER_POOL_MODE: transaction
+      DB_POOL_SIZE: ${POOLER_DB_POOL_SIZE}
+    command:
+      - /bin/sh
+      - -c
+      - /app/bin/migrate && /app/bin/server
 
   db:
-    image: supabase/postgres:15.1.1.28
-    deploy:
-      replicas: 1
-    environment:
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: postgres
-    volumes:
-      - /opt/supabase/docker/volumes/db/data:/var/lib/postgresql/data
-      - /opt/supabase/docker/volumes/db/roles.sql:/docker-entrypoint-initdb.d/init-scripts/99-roles.sql
+    image: supabase/postgres:15.8.1.085
     networks:
-      - internal
-
-networks:
-  captain-overlay-network:
-    external: true
-  internal:
-    driver: overlay
+      - db_overlay
+    volumes:
+      - /opt/supabase/volumes/db/realtime.sql:/docker-entrypoint-initdb.d/migrations/99-realtime.sql:Z
+      - /opt/supabase/volumes/db/webhooks.sql:/docker-entrypoint-initdb.d/init-scripts/98-webhooks.sql:Z
+      - /opt/supabase/volumes/db/roles.sql:/docker-entrypoint-initdb.d/init-scripts/99-roles.sql:Z
+      - /opt/supabase/volumes/db/jwt.sql:/docker-entrypoint-initdb.d/init-scripts/99-jwt.sql:Z
+      - /opt/supabase/volumes/db/data:/var/lib/postgresql/data:Z
+      - /opt/supabase/volumes/db/_supabase.sql:/docker-entrypoint-initdb.d/migrations/97-_supabase.sql:Z
+      - /opt/supabase/volumes/db/logs.sql:/docker-entrypoint-initdb.d/migrations/99-logs.sql:Z
+      - /opt/supabase/volumes/db/pooler.sql:/docker-entrypoint-initdb.d/migrations/99-pooler.sql:Z
+    healthcheck:
+      test: [ "CMD", "pg_isready", "-U", "postgres", "-h", "localhost" ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    deploy:
+      restart_policy:
+        condition: on-failure
+    environment:
+      POSTGRES_HOST: /var/run/postgresql
+      PGPORT: ${POSTGRES_PORT}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_HOST_AUTH_METHOD: trust
+      PGDATABASE: ${POSTGRES_DB}
+      POSTGRES_DB: ${POSTGRES_DB}
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXP: ${JWT_EXPIRY}
+    command:
+      - postgres
+      - -c
+      - config_file=/etc/postgresql/postgresql.conf
+      - -c
+      - log_min_messages=fatal
